@@ -53,6 +53,7 @@ TRADING_STRATEGIES = [
     "MlpSpeculativeStrategy",
     "PolymarketMomentumStrategy",
     "PolymarketMeanReversionStrategy",
+    "ZHMeanReversionStrategy",
 ]
 
 PORTFOLIO_STRATEGIES = [
