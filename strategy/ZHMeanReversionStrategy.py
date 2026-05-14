@@ -1,26 +1,27 @@
 """
-ZH Mean Reversion Strategy — ported from ZH-trading/strategies/v2/meanrev.py
+ZH Mean Reversion Strategy v3 — hybrid mean-reversion + momentum confirmation.
 
-Buys when price drops significantly below its rolling mean, expecting
-reversion. Exits when price reverts back to the mean or hits the stop.
+Combines multiple confirmation signals before entering a mean reversion trade:
+  1. Price deviation: price must be > entry_threshold below rolling mean
+  2. Bollinger Band: price must be at or below the lower band
+  3. RSI oversold: RSI must be below threshold (selling exhaustion)
+  4. Volume spike: above-average volume confirms reactionary move
+  5. Bullish candle: close > open on entry candle (buyers stepping in)
 
-Original logic:
-  1. Compute rolling moving average over `lookback` candles
-  2. Entry: price deviates below mean by > entry_threshold (percentage)
-  3. Exit: price reverts to within exit_threshold of the mean
-  4. Stop: entry_threshold × stop_multiple below entry price
-
-Works on both regular assets (BTC, stocks) and prediction market
-contracts. Set min_price/max_price to constrain the tradeable price
-range (e.g., 0.20–0.80 for probability-bounded contracts).
+Exit logic:
+  - Primary: price reverts to within exit_threshold of the mean
+  - Trailing: after reaching 0.5% profit, activate trailing stop at 0.3%
+  - Hard stop: entry_threshold × stop_multiple below entry
 
 Source: https://github.com/ZhuRong818/ZH-trading
 """
 
 from datetime import datetime
 
+import talib.abstract as ta
 from freqtrade.strategy import DecimalParameter, IntParameter, IStrategy
 from pandas import DataFrame
+from technical import qtpylib
 
 
 class ZHMeanReversionStrategy(IStrategy):
@@ -28,14 +29,19 @@ class ZHMeanReversionStrategy(IStrategy):
 
     can_short: bool = False
 
-    # No fixed ROI — exit via mean reversion signal only
-    minimal_roi = {}
+    # Take profit at 3% if reversion signal hasn't triggered
+    minimal_roi = {"0": 0.03}
 
-    # Fallback stoploss; actual stop is dynamic via custom_stoploss
+    # Hard stoploss fallback
     stoploss = -0.10
     use_custom_stoploss = True
 
-    trailing_stop = False
+    # Trailing stop: activate after 0.5% profit, trail at 0.3%
+    trailing_stop = True
+    trailing_stop_positive = 0.003
+    trailing_stop_positive_offset = 0.005
+    trailing_only_offset_is_reached = True
+
     process_only_new_candles = True
     use_exit_signal = True
     exit_profit_only = False
@@ -43,7 +49,7 @@ class ZHMeanReversionStrategy(IStrategy):
 
     startup_candle_count: int = 30
 
-    # --- Tunable parameters (matching ZH-trading defaults) ---
+    # --- Core mean reversion ---
     lookback = IntParameter(10, 50, default=20, space="buy")
     entry_threshold = DecimalParameter(
         0.005, 0.03, default=0.01, decimals=3, space="buy",
@@ -55,7 +61,20 @@ class ZHMeanReversionStrategy(IStrategy):
         1.0, 4.0, default=2.0, decimals=1, space="stoploss",
     )
 
-    # Regime filter — widen for regular assets, narrow for prediction markets
+    # --- Bollinger Band ---
+    bb_period = IntParameter(15, 30, default=20, space="buy")
+    bb_std = DecimalParameter(1.5, 3.0, default=2.0, decimals=1, space="buy")
+
+    # --- RSI ---
+    rsi_period = IntParameter(10, 20, default=14, space="buy")
+    rsi_oversold = IntParameter(20, 45, default=40, space="buy")
+
+    # --- Volume filter ---
+    volume_surge_threshold = DecimalParameter(
+        0.8, 3.0, default=1.2, decimals=1, space="buy",
+    )
+
+    # --- Regime filter ---
     min_price = DecimalParameter(0.0, 0.30, default=0.0, decimals=2, space="buy")
     max_price = DecimalParameter(
         0.70, 1000000.0, default=1000000.0, decimals=2, space="buy",
@@ -63,19 +82,43 @@ class ZHMeanReversionStrategy(IStrategy):
 
     def populate_indicators(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
         lb = self.lookback.value
+
+        # Core: rolling mean and deviation
         dataframe["moving_avg"] = dataframe["close"].rolling(window=lb).mean()
-        dataframe["deviation"] = dataframe["close"] - dataframe["moving_avg"]
         dataframe["deviation_pct"] = (
-            dataframe["deviation"] / dataframe["moving_avg"]
+            (dataframe["close"] - dataframe["moving_avg"]) / dataframe["moving_avg"]
         )
+
+        # Bollinger Bands
+        bollinger = qtpylib.bollinger_bands(
+            qtpylib.typical_price(dataframe),
+            window=self.bb_period.value,
+            stds=self.bb_std.value,
+        )
+        dataframe["bb_lower"] = bollinger["lower"]
+        dataframe["bb_middle"] = bollinger["mid"]
+
+        # RSI
+        dataframe["rsi"] = ta.RSI(dataframe, timeperiod=self.rsi_period.value)
+
+        # Volume surge
+        mean_vol = dataframe["volume"].rolling(20).mean()
+        dataframe["volume_surge"] = dataframe["volume"] / mean_vol.replace(0, 1)
+
         return dataframe
 
     def populate_entry_trend(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
         threshold = self.entry_threshold.value
         dataframe.loc[
             (
-                # Price well below moving average
+                # 1. Price well below rolling mean
                 (dataframe["deviation_pct"] < -threshold)
+                # 2. Price at or below lower Bollinger Band
+                & (dataframe["close"] <= dataframe["bb_lower"])
+                # 3. RSI confirms oversold
+                & (dataframe["rsi"] < self.rsi_oversold.value)
+                # 4. Volume spike — reactionary move
+                & (dataframe["volume_surge"] > self.volume_surge_threshold.value)
                 # Regime filter
                 & (dataframe["close"] > self.min_price.value)
                 & (dataframe["close"] < self.max_price.value)
@@ -88,8 +131,10 @@ class ZHMeanReversionStrategy(IStrategy):
         exit_thresh = self.exit_threshold.value
         dataframe.loc[
             (
-                # Price reverted back to within exit_threshold of the mean
+                # Price reverted to near the mean
                 (dataframe["deviation_pct"] >= -exit_thresh)
+                # OR price crossed above middle Bollinger Band
+                | (dataframe["close"] > dataframe["bb_middle"])
             ),
             "exit_long",
         ] = 1
